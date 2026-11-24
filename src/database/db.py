@@ -41,7 +41,12 @@ def create_student(new_name, face_embedding=None, voice_embedding=None):
     data = {'name': new_name, 'face_embedding':face_embedding, "voice_embedding": voice_embedding}
     response = supabase.table('students').insert(data).execute()
     return response.data
+def update_student_voice_embedding(student_id, voice_embedding):
+    response = supabase.table("students").update({
+        "voice_embedding": voice_embedding
+    }).eq("student_id", student_id).execute()
 
+    return response.data
 
 def create_subject(subject_code, name, section, teacher_id):
     data = {"subject_code": subject_code, "name": name, "section": section, "teacher_id": teacher_id}

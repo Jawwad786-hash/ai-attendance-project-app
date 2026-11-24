@@ -8,7 +8,7 @@ from PIL import Image
 import numpy as np
 from src.pipelines.face_pipeline import predict_attendance, get_face_embeddings, train_classifier
 from src.pipelines.voice_pipeline import get_voice_embedding
-from src.database.db import get_all_students, create_student, get_student_subjects, get_student_attendance, unenroll_student_to_subject
+from src.database.db import get_all_students, create_student, get_student_subjects, get_student_attendance, unenroll_student_to_subject,update_student_voice_embedding
 import time
 
 from src.components.dialog_enroll import enroll_dialog
@@ -29,7 +29,36 @@ def student_dashboard():
 
 
     st.space()
+    st.divider()
+    st.subheader("Voice Profile Enrollment")
 
+    if student_data.get("voice_embedding"):
+        st.success("Voice profile already enrolled.")
+        if st.button("Re-record Voice Profile"):
+            st.session_state["record_voice_profile"] = True
+    else:
+        st.info("No voice profile enrolled yet.")
+        if st.button("Enroll Voice Profile"):
+            st.session_state["record_voice_profile"] = True
+
+    if st.session_state.get("record_voice_profile", False):
+        voice_audio = st.audio_input(
+            "Record yourself saying: I am present, My name is " + student_data["name"]
+        )
+
+        if st.button("Save Voice Profile"):
+            if voice_audio is None:
+                st.warning("Please record your voice first.")
+            else:
+                with st.spinner("Processing your voice..."):
+                    embedding = get_voice_embedding(voice_audio.read())
+
+                    if embedding is not None:
+                        update_student_voice_embedding(student_id, embedding)
+                        st.session_state.student_data["voice_embedding"] = embedding
+                        st.session_state["record_voice_profile"] = False
+                        st.success("Voice profile saved successfully!")
+                        st.rerun()
     c1, c2 =st.columns(2)
     with c1:
         st.header('Your Enrolled Subjects')
@@ -69,7 +98,7 @@ def student_dashboard():
         def unenroll_button():
                 if st.button("Unenroll from tihs course", type='tertiary', width='stretch', icon=':material/delete_forever:'):
                     unenroll_student_to_subject(student_id, sid)
-                    st.toast(f'Unenrolled from {sub['name']} successfully!')
+                    st.toast(f"Unenrolled from {sub['name']} successfully!")
                     st.rerun()
 
         with cols[i % 2]:
@@ -133,7 +162,7 @@ def student_screen():
                         st.session_state.is_logged_in = True
                         st.session_state.user_role = 'student'
                         st.session_state.student_data = student
-                        st.toast(f'Welcome Back {student['name']}')
+                        st.toast(f"Welcome Back {student['name']}")
                         time.sleep(1)
                         st.rerun()
                 else:
