@@ -1,4 +1,6 @@
 import streamlit as st
+from postgrest.exceptions import APIError
+
 from src.database.db import create_attendance
 
 
@@ -23,6 +25,8 @@ def show_attendance_result(df, logs):
                 st.session_state.attendance_images = []
                 st.session_state.voice_attendance_results = None
                 st.rerun()
+            except APIError as exc:
+                st.error(f"Could not save attendance: {getattr(exc, 'message', str(exc))}")
             except Exception:
                 st.error("Sync failed! Please try again.")
 

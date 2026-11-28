@@ -4,6 +4,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+from postgrest.exceptions import APIError
 
 from src.components.dialog_add_photo import add_photos_dialog
 from src.components.dialog_attendance_results import attendance_result_dialog
@@ -12,16 +13,30 @@ from src.components.dialog_share_subject import share_subject_dialog
 from src.components.dialog_voice_attendance import voice_attendance_dialog
 from src.components.header import header_dashboard
 from src.components.subject_card import subject_card
-from src.database.config import supabase
 from src.database.db import (
     check_teacher_exists,
     create_teacher,
+    delete_subject,
+    generate_session_id,
     get_attendance_for_teacher,
+    get_enrolled_students_for_subject,
+    get_session_attendance_for_teacher,
+    get_subject_linked_counts,
     get_teacher_subjects,
+    save_manual_attendance_corrections,
     teacher_login,
+    verify_teacher_owns_subject,
 )
 from src.pipelines.face_pipeline import predict_attendance
 from src.ui.base_layout import style_background_dashboard, style_base_layout
+
+
+def _is_authorized_teacher():
+    return (
+        st.session_state.get("user_role") == "teacher"
+        and st.session_state.get("is_logged_in") is True
+        and "teacher_data" in st.session_state
+    )
 
 
 def _render_teacher_topbar(right_label=None, is_logged_in=False):
@@ -145,6 +160,10 @@ def teacher_dashboard():
 
 
 def teacher_tab_take_attendance():
+    if not _is_authorized_teacher():
+        st.error("Teacher authorization required.")
+        return
+
     teacher_id = st.session_state.teacher_data["teacher_id"]
     st.header("Take AI Attendance")
     st.markdown(
@@ -225,6 +244,10 @@ def teacher_tab_take_attendance():
                 icon=":material/analytics:",
                 disabled=not has_photos,
             ):
+                if not verify_teacher_owns_subject(teacher_id, selected_subject_id):
+                    st.error("You are not authorized to run attendance for this subject.")
+                    return
+
                 with st.spinner("Deep scanning classroom photos..."):
                     all_detected_ids = {}
 
@@ -239,13 +262,15 @@ def teacher_tab_take_attendance():
                                     f"Photo {idx + 1}"
                                 )
 
-                    enrolled_res = (
-                        supabase.table("subject_students")
-                        .select("*, students(*)")
-                        .eq("subject_id", selected_subject_id)
-                        .execute()
-                    )
-                    enrolled_students = enrolled_res.data
+                    try:
+                        enrolled_students = get_enrolled_students_for_subject(
+                            selected_subject_id
+                        )
+                    except APIError as exc:
+                        st.error(
+                            f"Could not load enrolled students: {getattr(exc, 'message', str(exc))}"
+                        )
+                        return
 
                     if not enrolled_students:
                         st.warning("No students enrolled in this course.")
@@ -254,9 +279,14 @@ def teacher_tab_take_attendance():
                         current_timestamp = datetime.now().strftime(
                             "%Y-%m-%dT%H:%M:%S"
                         )
+                        session_id = generate_session_id(
+                            selected_subject_id, current_timestamp
+                        )
 
                         for node in enrolled_students:
-                            student = node["students"]
+                            student = node.get("students")
+                            if not student:
+                                continue
                             sources = all_detected_ids.get(
                                 int(student["student_id"]), []
                             )
@@ -277,6 +307,7 @@ def teacher_tab_take_attendance():
                                 {
                                     "student_id": student["student_id"],
                                     "subject_id": selected_subject_id,
+                                    "session_id": session_id,
                                     "timestamp": current_timestamp,
                                     "is_present": bool(is_present),
                                 }
@@ -296,7 +327,85 @@ def teacher_tab_take_attendance():
                 voice_attendance_dialog(selected_subject_id)
 
 
+@st.dialog("Delete Subject")
+def _delete_subject_dialog(teacher_id, sub):
+    if not _is_authorized_teacher():
+        st.error("Teacher authorization required.")
+        return
+
+    subject_id = int(sub["subject_id"])
+    st.markdown(f"**{sub['name']}** (`{sub['subject_code']}` · Section {sub['section']})")
+
+    try:
+        link_info = get_subject_linked_counts(teacher_id, subject_id)
+    except PermissionError as exc:
+        st.error(str(exc))
+        return
+    except APIError as exc:
+        st.error(f"Database error checking linked records: {getattr(exc, 'message', str(exc))}")
+        return
+    except Exception as exc:
+        st.error(f"Could not inspect subject dependencies: {exc}")
+        return
+
+    enrolled_count = link_info["enrolled_count"]
+    attendance_count = link_info["attendance_count"]
+
+    if not link_info["can_delete"]:
+        st.warning(
+            f"Deletion blocked: this subject still has **{enrolled_count} enrolled student(s)** "
+            f"and **{attendance_count} attendance log(s)**."
+        )
+        st.info(
+            "To prevent silently deleting or orphaning student enrollments and attendance history, "
+            "subjects with linked records cannot be deleted directly. "
+            "Safe handling options: keep the subject intact for historical records, or have students unenroll "
+            "and use an explicitly approved archive/cleanup migration before removing historical attendance."
+        )
+        if st.button("Close", type="secondary", width="stretch"):
+            st.rerun()
+        return
+
+    st.caption("No students or attendance logs are linked to this subject.")
+    confirm_delete = st.checkbox(
+        "I confirm I want to permanently delete this subject.",
+        key=f"confirm_delete_sub_{subject_id}",
+    )
+
+    c1, c2 = st.columns(2, gap="small")
+    with c1:
+        if st.button("Cancel", type="secondary", width="stretch"):
+            st.rerun()
+    with c2:
+        if st.button(
+            "Confirm Delete",
+            type="primary",
+            icon=":material/delete:",
+            disabled=not confirm_delete,
+            width="stretch",
+        ):
+            try:
+                res = delete_subject(teacher_id, subject_id)
+                if res["deleted"]:
+                    st.toast(res["message"])
+                    st.rerun()
+                else:
+                    st.warning(res["message"])
+            except PermissionError as exc:
+                st.error(str(exc))
+            except APIError as exc:
+                st.error(
+                    f"Database error deleting subject: {getattr(exc, 'message', str(exc))}"
+                )
+            except Exception as exc:
+                st.error(f"Could not delete subject: {exc}")
+
+
 def teacher_tab_manage_subjects():
+    if not _is_authorized_teacher():
+        st.error("Teacher authorization required.")
+        return
+
     teacher_id = st.session_state.teacher_data["teacher_id"]
     col1, col2 = st.columns([3, 1.3], vertical_alignment="center")
     with col1:
@@ -348,15 +457,31 @@ def teacher_tab_manage_subjects():
                 ("🕰️", "Classes", sub["total_classes"]),
             ]
 
-            def share_btn(sub_name=sub["name"], sub_code=sub["subject_code"]):
-                if st.button(
-                    f"Share Code: {sub_name}",
-                    key=f"share_{sub_code}",
-                    type="tertiary",
-                    icon=":material/share:",
-                    width="stretch",
-                ):
-                    share_subject_dialog(sub_name, sub_code)
+            def card_actions(
+                sub_row=sub,
+                sub_id=sub["subject_id"],
+                sub_name=sub["name"],
+                sub_code=sub["subject_code"],
+            ):
+                b1, b2 = st.columns([2, 1], gap="small")
+                with b1:
+                    if st.button(
+                        f"Share Code: {sub_code}",
+                        key=f"share_{sub_code}_{sub_id}",
+                        type="tertiary",
+                        icon=":material/share:",
+                        width="stretch",
+                    ):
+                        share_subject_dialog(sub_name, sub_code)
+                with b2:
+                    if st.button(
+                        "Delete",
+                        key=f"delete_sub_{sub_id}",
+                        type="secondary",
+                        icon=":material/delete:",
+                        width="stretch",
+                    ):
+                        _delete_subject_dialog(teacher_id, sub_row)
 
             with cols[i % 2]:
                 subject_card(
@@ -364,55 +489,228 @@ def teacher_tab_manage_subjects():
                     code=sub["subject_code"],
                     section=sub["section"],
                     stats=stats,
-                    footer_callback=share_btn,
+                    footer_callback=card_actions,
                 )
     else:
         with st.container(key="snap_card_teacher_empty", border=True):
             st.info("No subjects found yet. Create one above to get started.")
 
 
+def _format_session_time(ts_str):
+    if not ts_str:
+        return "N/A"
+    try:
+        return datetime.fromisoformat(str(ts_str)).strftime("%Y-%m-%d %I:%M %p")
+    except ValueError:
+        return str(ts_str)
+
+
+def _render_manual_correction_panel(teacher_id, session_options):
+    st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
+    with st.container(key="snap_card_manual_correction", border=True):
+        st.subheader("Manual Attendance Correction")
+        st.markdown(
+            '<p class="snap-subtitle" style="margin-bottom:0.9rem;">Select a recorded session to review or correct student attendance. Confirmation is required before saving.</p>',
+            unsafe_allow_html=True,
+        )
+
+        selected_label = st.selectbox(
+            "Select Session to Correct",
+            options=list(session_options.keys()),
+            key="manual_corr_session_select",
+        )
+        selected_meta = session_options[selected_label]
+        session_key = selected_meta["session_key"]
+
+        try:
+            session_data = get_session_attendance_for_teacher(
+                teacher_id=teacher_id,
+                subject_id=selected_meta["subject_id"],
+                session_id=selected_meta["session_id"],
+                legacy_timestamp=selected_meta["raw_timestamp"]
+                if not selected_meta["session_id"]
+                else None,
+            )
+        except PermissionError as exc:
+            st.error(str(exc))
+            return
+        except APIError as exc:
+            st.error(f"Database error loading session: {getattr(exc, 'message', str(exc))}")
+            return
+        except Exception as exc:
+            st.error(f"Could not load session details: {exc}")
+            return
+
+        rows = session_data["rows"]
+        ambiguous_ids = session_data["ambiguous_student_ids"]
+
+        if ambiguous_ids:
+            st.warning(
+                "Ambiguous legacy records were detected for this timestamp (multiple rows exist for the same student). "
+                "Each record is listed separately by `attendance_id` below and will not be merged."
+            )
+
+        if not rows:
+            st.info("No enrolled students or attendance rows found for this session.")
+            return
+
+        st.markdown("---")
+        pending_changes = []
+
+        for row in rows:
+            rkey = row["row_key"]
+            widget_key = f"corr_{session_key}_{rkey}"
+            original_present = bool(row["is_present"])
+
+            c_name, c_orig, c_new = st.columns([2.4, 1.2, 1.4], vertical_alignment="center")
+            with c_name:
+                extra = ""
+                if not row["is_enrolled"]:
+                    extra = " · Unenrolled"
+                elif not row["was_logged"]:
+                    extra = " · Not originally logged"
+                st.markdown(
+                    f"**{row['name']}**  \n"
+                    f"<span style='color:#64748B; font-size:0.84rem;'>ID {row['student_id']}{extra}</span>",
+                    unsafe_allow_html=True,
+                )
+            with c_orig:
+                badge = "✅ Present" if original_present else "❌ Absent"
+                st.caption(f"Current: {badge}")
+            with c_new:
+                new_present = st.checkbox(
+                    "Mark Present",
+                    value=original_present,
+                    key=widget_key,
+                )
+
+            if bool(new_present) != original_present:
+                pending_changes.append(
+                    {
+                        "attendance_id": row["attendance_id"],
+                        "student_id": row["student_id"],
+                        "name": row["name"],
+                        "previous_status": original_present,
+                        "new_status": bool(new_present),
+                    }
+                )
+
+        st.markdown("---")
+
+        if pending_changes:
+            summary_lines = [
+                f"- **{chg['name']}**: {'Present' if chg['previous_status'] else 'Absent'} → "
+                f"**{'Present' if chg['new_status'] else 'Absent'}**"
+                for chg in pending_changes
+            ]
+            st.info("Pending changes to save:\n" + "\n".join(summary_lines))
+        else:
+            st.caption("Toggle one or more students above to make a correction.")
+
+        confirm_key = f"confirm_corr_{session_key}"
+        if st.session_state.pop("reset_corr_confirm_for", None) == confirm_key:
+            st.session_state[confirm_key] = False
+
+        confirmed = st.checkbox(
+            "I confirm I want to save these attendance status corrections.",
+            key=confirm_key,
+            disabled=not pending_changes,
+        )
+
+        if st.button(
+            "Save Corrections",
+            type="primary",
+            icon=":material/check_circle:",
+            disabled=not (pending_changes and confirmed),
+            width="stretch",
+        ):
+            if not _is_authorized_teacher():
+                st.error("Teacher authorization required.")
+                return
+            try:
+                result = save_manual_attendance_corrections(
+                    teacher_id=teacher_id,
+                    subject_id=selected_meta["subject_id"],
+                    corrections=pending_changes,
+                    session_id=selected_meta["session_id"],
+                    session_timestamp=selected_meta["raw_timestamp"],
+                )
+                st.session_state["reset_corr_confirm_for"] = confirm_key
+                st.toast(
+                    f"Saved corrections ({result['updated']} updated, {result['inserted']} added)."
+                )
+                st.success(
+                    f"Corrections saved ({result['updated']} updated, {result['inserted']} added)."
+                )
+                st.rerun()
+            except (PermissionError, ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+            except APIError as exc:
+                st.error(f"Database error saving corrections: {getattr(exc, 'message', str(exc))}")
+            except Exception as exc:
+                st.error(f"Unexpected error saving corrections: {exc}")
+
+
 def teacher_tab_attendance_records():
+    if not _is_authorized_teacher():
+        st.error("Teacher authorization required.")
+        return
+
     st.header("Attendance Records")
     st.markdown(
-        '<p class="snap-subtitle" style="margin-bottom:1rem;">Overview of all recorded attendance sessions across your subjects.</p>',
+        '<p class="snap-subtitle" style="margin-bottom:1rem;">Overview of recorded attendance sessions and manual corrections.</p>',
         unsafe_allow_html=True,
     )
 
     teacher_id = st.session_state.teacher_data["teacher_id"]
-    records = get_attendance_for_teacher(teacher_id)
+    try:
+        records = get_attendance_for_teacher(teacher_id)
+    except APIError as exc:
+        st.error(f"Could not load attendance records: {getattr(exc, 'message', str(exc))}")
+        return
+    except Exception as exc:
+        st.error(f"Could not load attendance records: {exc}")
+        return
 
     if not records:
         with st.container(key="snap_card_records_empty", border=True):
             st.info("No attendance records logged yet.")
         return
 
-    data = []
+    grouped = {}
     for r in records:
         ts = r.get("timestamp")
-        data.append(
+        sub = r.get("subjects") or {}
+        sub_id = int(r["subject_id"])
+        sid = r.get("session_id")
+        if sid:
+            session_key = f"sid:{sid}"
+        else:
+            session_key = f"legacy:{sub_id}:{ts}"
+
+        bucket = grouped.setdefault(
+            session_key,
             {
-                "ts_group": ts.split(".")[0] if ts else None,
-                "Time": datetime.fromisoformat(ts).strftime("%Y-%m-%d %I:%M %p")
-                if ts
-                else "N/A",
-                "Subject": r["subjects"]["name"],
-                "Subject Code": r["subjects"]["subject_code"],
-                "is_present": bool(r.get("is_present", False)),
-            }
+                "session_key": session_key,
+                "session_id": sid,
+                "subject_id": sub_id,
+                "raw_timestamp": ts or "",
+                "sort_key": str(ts or ""),
+                "time_display": _format_session_time(ts),
+                "subject_name": sub.get("name", ""),
+                "subject_code": sub.get("subject_code", ""),
+                "present_count": 0,
+                "total_count": 0,
+            },
         )
+        bucket["total_count"] += 1
+        if r.get("is_present"):
+            bucket["present_count"] += 1
 
-    df = pd.DataFrame(data)
-    summary = (
-        df.groupby(["ts_group", "Time", "Subject", "Subject Code"])
-        .agg(
-            Present_Count=("is_present", "sum"),
-            Total_Count=("is_present", "count"),
-        )
-        .reset_index()
-    )
+    sessions = sorted(grouped.values(), key=lambda s: s["sort_key"], reverse=True)
 
-    total_present = int(summary["Present_Count"].sum())
-    total_possible = int(summary["Total_Count"].sum())
+    total_present = sum(s["present_count"] for s in sessions)
+    total_possible = sum(s["total_count"] for s in sessions)
     avg_rate = (
         f"{round((total_present / total_possible) * 100)}%"
         if total_possible > 0
@@ -422,7 +720,7 @@ def teacher_tab_attendance_records():
     m1, m2 = st.columns(2, gap="medium")
     with m1:
         st.markdown(
-            f'<div class="snap-stat-box"><div class="snap-stat-label">Recorded Sessions</div><div class="snap-stat-value">{len(summary)}</div></div>',
+            f'<div class="snap-stat-box"><div class="snap-stat-label">Recorded Sessions</div><div class="snap-stat-value">{len(sessions)}</div></div>',
             unsafe_allow_html=True,
         )
     with m2:
@@ -433,19 +731,31 @@ def teacher_tab_attendance_records():
 
     st.markdown("<div style='height:0.85rem;'></div>", unsafe_allow_html=True)
 
-    summary["Attendance Stats"] = (
-        "✅ "
-        + summary["Present_Count"].astype(str)
-        + " / "
-        + summary["Total_Count"].astype(str)
-        + " Students"
-    )
-
-    display_df = summary.sort_values(by="ts_group", ascending=False)[
-        ["Time", "Subject", "Subject Code", "Attendance Stats"]
+    display_rows = [
+        {
+            "Time": s["time_display"],
+            "Subject": s["subject_name"],
+            "Subject Code": s["subject_code"],
+            "Session Type": "Session ID" if s["session_id"] else "Legacy",
+            "Attendance Stats": f"✅ {s['present_count']} / {s['total_count']} Students",
+        }
+        for s in sessions
     ]
+    st.dataframe(pd.DataFrame(display_rows), width="stretch", hide_index=True)
 
-    st.dataframe(display_df, width="stretch", hide_index=True)
+    session_options = {}
+    for s in sessions:
+        tag = "" if s["session_id"] else " [Legacy]"
+        label = (
+            f"{s['time_display']} — {s['subject_name']} ({s['subject_code']}){tag}"
+        )
+        # Ensure label uniqueness if two sessions share the same minute/second display.
+        if label in session_options:
+            short_id = s["session_id"][-6:] if s["session_id"] else s["raw_timestamp"][-6:]
+            label = f"{label} [{short_id}]"
+        session_options[label] = s
+
+    _render_manual_correction_panel(teacher_id, session_options)
 
 
 def login_teacher(username, password):
